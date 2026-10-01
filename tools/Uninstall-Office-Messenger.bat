@@ -1,13 +1,15 @@
 @echo off
+:: Full paths, so it also works on PCs whose PATH is missing the PowerShell folder
+set "PSEXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 :: Removes Office Messenger from this PC (double-click, then click Yes).
 
-net session >nul 2>&1
+"%SystemRoot%\System32\net.exe" session >nul 2>&1
 if errorlevel 1 (
-    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    "%PSEXE%" -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
     exit /b
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = Get-Content -LiteralPath '%~f0' -Raw; Invoke-Expression ($c.Substring($c.IndexOf('#PS' + 'START')))"
+"%PSEXE%" -NoProfile -ExecutionPolicy Bypass -Command "$c = Get-Content -LiteralPath '%~f0' -Raw; Invoke-Expression ($c.Substring($c.IndexOf('#PS' + 'START')))"
 echo.
 pause
 exit /b

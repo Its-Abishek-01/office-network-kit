@@ -1,17 +1,19 @@
 @echo off
+:: Full paths, so it also works on PCs whose PATH is missing the PowerShell folder
+set "PSEXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 :: Office Network Kit - sets up THIS PC for the office network.
 :: Double-click, then click Yes. It asks before each part:
 ::   1. Network sharing  (office network = Private, discovery + file/printer sharing)
 ::   2. Office Messenger (pop-up messages between office PCs)
 
-net session >nul 2>&1
+"%SystemRoot%\System32\net.exe" session >nul 2>&1
 if errorlevel 1 (
-    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    "%PSEXE%" -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
     exit /b
 )
 
 set "KIT_DIR=%~dp0"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = Get-Content -LiteralPath '%~f0' -Raw; Invoke-Expression ($c.Substring($c.IndexOf('#PS' + 'START')))"
+"%PSEXE%" -NoProfile -ExecutionPolicy Bypass -Command "$c = Get-Content -LiteralPath '%~f0' -Raw; Invoke-Expression ($c.Substring($c.IndexOf('#PS' + 'START')))"
 echo.
 pause
 exit /b
@@ -159,7 +161,7 @@ if (Ask-YesNo 'Install Office Messenger on this PC?') {
             $name = (Read-Host "  Name others will see in the messenger [Enter = $default]").Trim()
             if (-not $name) { $name = $default }
             @{ Name = $name } | ConvertTo-Json | Set-Content -LiteralPath $cfg -Encoding UTF8
-            icacls $cfg /grant "*S-1-5-32-545:M" | Out-Null      # users can change the name from the tray menu
+            & "$env:SystemRoot\System32\icacls.exe" $cfg /grant "*S-1-5-32-545:M" | Out-Null      # users can change the name from the tray menu
             Ok "Messenger name: '$name'"
 
             Get-NetFirewallRule -DisplayName 'Office Messenger*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
@@ -207,7 +209,7 @@ if (Ask-YesNo 'Install Office Messenger on this PC?') {
 
 # Start the messenger as the signed-in user (not as administrator)
 if ($messengerInstalled) {
-    Start-Process explorer.exe -ArgumentList "`"$desktopLnk`""
+    Start-Process "$env:SystemRoot\explorer.exe" -ArgumentList "`"$desktopLnk`""
     Ok "Office Messenger started - look for the blue chat icon near the clock"
 }
 
