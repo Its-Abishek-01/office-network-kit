@@ -23,6 +23,16 @@ ON EACH OFFICE PC
   Safe to run again on the same PC (for example to update the messenger).
   Every PC you set up is recorded in office-pcs.csv.
 
+CHECK THE WHOLE OFFICE
+  Double-click  tools\Check-Office.bat  (no admin needed, changes nothing).
+  It lists every PC: messenger running + version, file sharing on/off.
+
+UPDATING TO A NEW VERSION
+  Copy your messenger\messenger-key.txt into the new kit first, then run
+  Setup-This-PC.bat on each PC: n to network sharing, Y to Office Messenger.
+  No need to update all PCs at once - old and new versions work together.
+  Messages are encrypted when BOTH PCs run v1.2 or later.
+
 THE OFFICE KEY (messenger-key.txt)
   - The FIRST time you install the messenger, the setup creates a new office key
     in the messenger folder. Use the SAME kit (same key) for every PC in the office.

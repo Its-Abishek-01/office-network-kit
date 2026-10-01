@@ -5,12 +5,14 @@
 param(
     [string]$ConfigDir = "$env:ProgramData\OfficeMessenger",
     [int]$Port = 51515,
-    [ValidateSet('Any', 'Loopback')][string]$Bind = 'Any',
+    [string]$Bind = 'Any',      # 'Any', 'Loopback', or (testing) a 127.x address
     [switch]$Show,              # open the Send window on start (desktop shortcut)
     [string]$MakeIcon,          # installer: write the app icon to this .ico path and exit
     [string]$SendTo,            # command line: send -Message to this IP and exit
     [string]$Message,
     [switch]$Urgent,
+    [string]$ToPc,              # command line: recipient PC name -> sends encrypted (needs v1.2+ on that PC)
+    [string]$PcName,            # testing: pretend to be this PC
     [string]$Preview            # testing: render the windows to PNG files in this folder and exit
 )
 
@@ -19,6 +21,8 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 [System.Windows.Forms.Application]::SetUnhandledExceptionMode('CatchException')   # must come before any window/control is created
 
 $AppName       = 'Office Messenger'
+$AppVersion    = '1.2.0'
+$ProjectUrl    = 'https://github.com/Its-Abishek-01/office-network-kit'
 $OnlineSeconds = 150     # a PC counts as online if heard from within this time
 $AvatarColors  = '#2563EB', '#7C3AED', '#DB2777', '#EA580C', '#059669', '#0891B2', '#CA8A04', '#4F46E5'
 
@@ -68,26 +72,69 @@ $LogFile = Join-Path $LogDir 'history.txt'
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 if (-not (Test-Path -LiteralPath $KeyFile)) {
-    [void][System.Windows.MessageBox]::Show("$AppName is not installed correctly (office key missing).`nRun Install-Office-Messenger.bat again.", $AppName, 'OK', 'Error')
+    [void][System.Windows.MessageBox]::Show("$AppName is not installed correctly (office key missing).`nRun Setup-This-PC.bat again.", $AppName, 'OK', 'Error')
     return
 }
-$Hmac = [Security.Cryptography.HMACSHA256]::new([Convert]::FromBase64String((Get-Content -LiteralPath $KeyFile -Raw).Trim()))
+$OfficeKey = [Convert]::FromBase64String((Get-Content -LiteralPath $KeyFile -Raw).Trim())
+$Hmac = [Security.Cryptography.HMACSHA256]::new($OfficeKey)
 
-$MyPc   = $env:COMPUTERNAME
+# v1.2 keys, derived from the same office key (no new key to distribute)
+function Get-SubKey([string]$Label) { [Security.Cryptography.HMACSHA256]::new($OfficeKey).ComputeHash([Text.Encoding]::UTF8.GetBytes($Label)) }
+$EncKey = Get-SubKey 'office-messenger/v2/encrypt'
+$Hmac2  = [Security.Cryptography.HMACSHA256]::new((Get-SubKey 'office-messenger/v2/sign'))
+
+$MyPc   = if ($PcName) { $PcName } else { $env:COMPUTERNAME }
 $MyName = $env:USERNAME
+$UpdateCheck = $true
 if (Test-Path -LiteralPath $CfgFile) {
-    try { $n = (Get-Content -LiteralPath $CfgFile -Raw | ConvertFrom-Json).Name; if ($n) { $MyName = $n } } catch {}
+    try {
+        $cfg = Get-Content -LiteralPath $CfgFile -Raw | ConvertFrom-Json
+        if ($cfg.Name) { $MyName = $cfg.Name }
+        if ($cfg.PSObject.Properties['UpdateCheck'] -and $cfg.UpdateCheck -eq $false) { $UpdateCheck = $false }
+    } catch {}
 }
 
 function Write-History([string]$Line) {
     try { Add-Content -LiteralPath $LogFile -Value ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd hh:mm tt'), $Line) -Encoding UTF8 } catch {}
 }
 
-# ---------------------------------------------------------------- protocol (unchanged - works with older versions)
+# ---------------------------------------------------------------- protocol
+#
+# Two packet formats, one JSON line each:
+#   v1  (all versions)  {type,id,pc,name,ts,text,urgent,sig}       text in clear, HMAC 'sig'
+#   v2  (v1.2+)         {v:2,type,id,pc,name,ts,to,urgent,ver,iv,enc,sig2}
+#                       text encrypted with AES-256-CBC, then HMAC 'sig2' over everything (encrypt-then-MAC);
+#                       'to' = recipient PC name, so a message can never land on the wrong PC.
+# v1.2+ PCs put "caps=2;ver=x.y.z" in the text of their (v1) hello packets. Older PCs ignore that text,
+# so they keep working; v1.2+ PCs send v2 to PCs that announced caps=2 and v1 to everyone else.
+# Older PCs answer 'NO' to v2 packets (no 'sig' field), so they never show an encrypted message as gibberish.
+
+$CapsText = "caps=2;ver=$AppVersion"
 
 function Get-SigText($p) { '{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f $p.type, $p.id, $p.pc, $p.name, $p.ts, $p.text, $p.urgent }
 function Get-Sig([string]$s) { [Convert]::ToBase64String($Hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))) }
+function Get-SigText2($p) { '2|{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}' -f $p.type, $p.id, $p.pc, $p.name, $p.ts, $p.to, $p.urgent, $p.ver, $p.iv, $p.enc }
+function Get-Sig2([string]$s) { [Convert]::ToBase64String($Hmac2.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))) }
 
+function Test-SameString([string]$a, [string]$b) {   # constant-time compare
+    if ($a.Length -ne $b.Length) { return $false }
+    $d = 0; for ($i = 0; $i -lt $a.Length; $i++) { $d = $d -bor ([int]$a[$i] -bxor [int]$b[$i]) }
+    $d -eq 0
+}
+
+function Protect-Text([string]$Text) {
+    $aes = [Security.Cryptography.Aes]::Create(); $aes.Key = $EncKey; $aes.GenerateIV()
+    $b = [Text.Encoding]::UTF8.GetBytes($Text)
+    $c = $aes.CreateEncryptor().TransformFinalBlock($b, 0, $b.Length)
+    @{ iv = [Convert]::ToBase64String($aes.IV); enc = [Convert]::ToBase64String($c) }
+}
+function Unprotect-Text([string]$Iv, [string]$Enc) {
+    $aes = [Security.Cryptography.Aes]::Create(); $aes.Key = $EncKey; $aes.IV = [Convert]::FromBase64String($Iv)
+    $c = [Convert]::FromBase64String($Enc)
+    [Text.Encoding]::UTF8.GetString($aes.CreateDecryptor().TransformFinalBlock($c, 0, $c.Length))
+}
+
+# v1 packet (understood by every version)
 function New-Packet([string]$Type, [string]$Text = '', [bool]$IsUrgent = $false) {
     $p = [ordered]@{
         type = $Type; id = [guid]::NewGuid().ToString('N'); pc = $MyPc; name = $MyName
@@ -97,33 +144,77 @@ function New-Packet([string]$Type, [string]$Text = '', [bool]$IsUrgent = $false)
     $p | ConvertTo-Json -Compress
 }
 
-# Returns the packet if it is signed with the office key and recent, else $null
+# v2 packet: encrypted text, addressed to one PC (only for PCs running v1.2+)
+function New-Packet2([string]$Type, [string]$To, [string]$Text, [bool]$IsUrgent = $false) {
+    $e = Protect-Text $Text
+    $p = [ordered]@{
+        v = 2; type = $Type; id = [guid]::NewGuid().ToString('N'); pc = $MyPc; name = $MyName
+        ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); to = $To; urgent = $IsUrgent; ver = $AppVersion
+        iv = $e.iv; enc = $e.enc
+    }
+    $p.sig2 = Get-Sig2 (Get-SigText2 $p)
+    $p | ConvertTo-Json -Compress
+}
+
+# Returns the packet (v2: with .text decrypted) if it is genuine and recent, else $null
 function Read-Packet([string]$Json) {
     if (-not $Json) { return $null }
     try { $p = $Json | ConvertFrom-Json } catch { return $null }
-    if (-not $p -or -not $p.sig -or -not $p.type) { return $null }
-    if ((Get-Sig (Get-SigText $p)) -ne $p.sig) { return $null }
+    if (-not $p -or -not $p.type) { return $null }
+    if ($p.PSObject.Properties['v'] -and $p.v -eq 2) {
+        if (-not $p.sig2 -or -not (Test-SameString (Get-Sig2 (Get-SigText2 $p)) $p.sig2)) { return $null }
+        try { $text = Unprotect-Text $p.iv $p.enc } catch { return $null }
+        $p | Add-Member -NotePropertyName text -NotePropertyValue $text -Force
+    } else {
+        if (-not $p.sig -or -not (Test-SameString (Get-Sig (Get-SigText $p)) $p.sig)) { return $null }
+        $p | Add-Member -NotePropertyName v -NotePropertyValue 1 -Force
+    }
     $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$p.ts
     if ([Math]::Abs($age) -gt 900) { return $null }
     $p
 }
 
-# Sends one packet over TCP; $true when the other PC confirms it
+# "caps=2;ver=1.2.0" -> @{ Caps = 2; Ver = '1.2.0' }; anything else (older versions) -> Caps 1
+function Read-Caps([string]$Text) {
+    $r = @{ Caps = 1; Ver = '' }
+    foreach ($part in "$Text".Split(';')) {
+        $kv = $part.Split('=', 2)
+        if ($kv.Count -eq 2 -and $kv[0] -eq 'caps') { $n = 0; if ([int]::TryParse($kv[1], [ref]$n)) { $r.Caps = $n } }
+        if ($kv.Count -eq 2 -and $kv[0] -eq 'ver')  { $r.Ver = $kv[1] }
+    }
+    $r
+}
+
+function ConvertTo-Version([string]$s) {
+    $parts = @(($s.TrimStart('v', 'V') -split '[^0-9]+') | Where-Object { $_ -ne '' } | Select-Object -First 3)
+    while ($parts.Count -lt 3) { $parts += '0' }
+    try { [version]($parts -join '.') } catch { [version]'0.0.0' }
+}
+
+# Sends one packet over TCP. Returns the other PC's answer: 'OK', 'NO', 'WRONG' (not the intended PC) or $null (no answer)
 function Send-OfficePacket([string]$Ip, [string]$Json) {
-    $c = New-Object Net.Sockets.TcpClient
+    $c = if ($Bind -in 'Any', 'Loopback') { New-Object Net.Sockets.TcpClient }
+         else { New-Object Net.Sockets.TcpClient((New-Object Net.IPEndPoint([Net.IPAddress]::Parse($Bind), 0))) }   # testing: send from our own test address
     try {
-        if (-not $c.ConnectAsync($Ip, $Port).Wait(2500)) { return $false }
+        if (-not $c.ConnectAsync($Ip, $Port).Wait(2500)) { return $null }
         $s = $c.GetStream(); $s.ReadTimeout = 4000; $s.WriteTimeout = 4000
         $w = New-Object IO.StreamWriter($s, (New-Object Text.UTF8Encoding($false))); $w.AutoFlush = $true
         $w.WriteLine($Json)
         $r = New-Object IO.StreamReader($s, [Text.Encoding]::UTF8)
-        return ($r.ReadLine() -eq 'OK')
-    } catch { return $false } finally { $c.Close() }
+        return $r.ReadLine()
+    } catch { return $null } finally { $c.Close() }
 }
 
 if ($SendTo) {
-    $ok = Send-OfficePacket $SendTo (New-Packet 'msg' $Message $Urgent.IsPresent)
-    if ($ok) { "Delivered to $SendTo" } else { "NOT delivered to $SendTo" }
+    $json = if ($ToPc) { New-Packet2 'msg' $ToPc $Message $Urgent.IsPresent } else { New-Packet 'msg' $Message $Urgent.IsPresent }
+    $ans = Send-OfficePacket $SendTo $json
+    $how = if ($ToPc) { "encrypted, to $ToPc" } else { 'not encrypted' }
+    switch ($ans) {
+        'OK'    { "Delivered to $SendTo ($how)" }
+        'WRONG' { "NOT delivered: $SendTo is not $ToPc" }
+        'NO'    { "NOT delivered: $SendTo rejected it$(if ($ToPc) { ' (older version? send without -ToPc)' })" }
+        default { "NOT delivered to $SendTo (no answer)" }
+    }
     return
 }
 
@@ -374,7 +465,9 @@ $OnReplyClick = {
     $text = if ($t.Box) { $t.Box.Text.Trim() } else { $t.Text }
     if (-not $text) { return }
     $t.Win.IsEnabled = $false; Update-Ui
-    if (Send-OfficePacket $t.Ip (New-Packet 'reply' $text)) {
+    # answer in the format the message came in: encrypted to v1.2+ PCs, plain v1 to older ones
+    $json = if ($t.V -eq 2) { New-Packet2 'reply' $t.Pc $text } else { New-Packet 'reply' $text }
+    if ((Send-OfficePacket $t.Ip $json) -eq 'OK') {
         Write-History "Replied to $($t.To): $text"
         $t.Win.Close()
     } else {
@@ -399,7 +492,7 @@ function Show-Message($p, [string]$FromIp, [string]$SaveAs) {
     $n.AvatarBg.Fill  = New-Brush (Get-AvatarColor $p.name)
     $n.Initials.Text  = Get-Initials $p.name
     $n.Title.Text     = $p.name
-    $n.Meta.Text      = "$($p.pc)   $([char]0x00B7)   $(Get-Date -Format 'h:mm tt')"
+    $n.Meta.Text      = "$($p.pc)   $([char]0x00B7)   $(Get-Date -Format 'h:mm tt')   $([char]0x00B7)   $(if ($p.v -eq 2) { 'Encrypted' } else { 'Not encrypted (older version)' })"
     $n.Body.Text      = $p.text
 
     if ($isUrgent) {
@@ -415,10 +508,10 @@ function Show-Message($p, [string]$FromIp, [string]$SaveAs) {
     }
 
     foreach ($b in $n.Q1, $n.Q2, $n.Q3) {
-        $b.Tag = @{ Win = $win; Ip = $FromIp; To = $p.name; Text = [string]$b.Content }
+        $b.Tag = @{ Win = $win; Ip = $FromIp; To = $p.name; Pc = $p.pc; V = $p.v; Text = [string]$b.Content }
         $b.Add_Click($OnReplyClick)
     }
-    $n.ReplySend.Tag = @{ Win = $win; Ip = $FromIp; To = $p.name; Box = $n.ReplyText }
+    $n.ReplySend.Tag = @{ Win = $win; Ip = $FromIp; To = $p.name; Pc = $p.pc; V = $p.v; Box = $n.ReplyText }
     $n.ReplySend.Add_Click($OnReplyClick)
     $n.ReplyText.Tag = $n
     $n.ReplyText.Add_TextChanged({ $this.Tag.ReplyHint.Visibility = if ($this.Text) { 'Collapsed' } else { 'Visible' } })
@@ -566,12 +659,18 @@ $QuickMessages = 'Come to my desk', 'Call me', 'Meeting now', 'Check your email'
 $script:SW = $null
 $script:RefreshAt = $null
 
+function Get-MeText {
+    $s = "Signed in as $MyName  ($MyPc)   $([char]0x00B7)   v$AppVersion"
+    if ($script:NewerVersion) { $s += "   $([char]0x00B7)   v$($script:NewerVersion) available" }
+    $s
+}
+
 function New-PersonRow($pe) {
     $row = New-Xaml $PersonXaml
     $row.FindName('Av').Fill  = New-Brush (Get-AvatarColor $pe.Name)
     $row.FindName('Ini').Text = Get-Initials $pe.Name
     $row.FindName('Nm').Text  = $pe.Name
-    $row.FindName('Pc').Text  = $pe.Pc
+    $row.FindName('Pc').Text  = if ($pe.Caps -ge 2) { "$($pe.Pc)   $([char]0x00B7)   v$($pe.Ver)" } else { "$($pe.Pc)   $([char]0x00B7)   older version (not encrypted)" }
     $row
 }
 
@@ -601,7 +700,7 @@ function Update-PeopleList {
     $onlinePcs = @($online | ForEach-Object { $_.Pc })
     foreach ($s in @($ui.Selected)) { if ($onlinePcs -notcontains $s) { [void]$ui.Selected.Remove($s) } }
 
-    $sig = ($shown | ForEach-Object { "$($_.Pc)=$($_.Name)" }) -join '|'
+    $sig = ($shown | ForEach-Object { "$($_.Pc)=$($_.Name)=$($_.Caps)=$($_.Ver)" }) -join '|'
     if ($sig -ne $ui.LastSig) {
         $ui.Rebuilding = $true
         $ui.People.Items.Clear()
@@ -623,7 +722,7 @@ function Update-PeopleList {
 
 function Find-People {
     Update-Broadcasts
-    Send-Udp (New-Packet 'hello?') $script:Broadcasts
+    Send-Udp (New-Packet 'hello?' $CapsText) $script:Broadcasts
     $script:RefreshAt = (Get-Date).AddMilliseconds(900)
     Set-Status 'Looking for people online...'
 }
@@ -637,14 +736,25 @@ function Invoke-Send {
 
     $ui.SendBtn.IsEnabled = $false
     Set-Status ('Sending to {0}...' -f ($targets.Name -join ', ')); Update-Ui
-    $ok = @(); $bad = @()
+    $ok = @(); $plain = @(); $bad = @(); $moved = @()
+    $urgent = [bool]$ui.Urgent.IsChecked
     foreach ($t in $targets) {
-        if (Send-OfficePacket $t.Ip (New-Packet 'msg' $text ([bool]$ui.Urgent.IsChecked))) { $ok += $t.Name } else { $bad += $t.Name }
+        # encrypted + addressed for v1.2+ PCs; the old format for PCs that haven't been updated yet
+        $json = if ($t.Caps -ge 2) { New-Packet2 'msg' $t.Pc $text $urgent } else { New-Packet 'msg' $text $urgent }
+        switch (Send-OfficePacket $t.Ip $json) {
+            'OK'    { $ok += $t.Name; if ($t.Caps -lt 2) { $plain += $t.Name } }
+            'WRONG' { $moved += $t.Name }      # another PC now has that IP (e.g. after a router restart)
+            default { $bad += $t.Name }
+        }
     }
+    if ($moved.Count) { Find-People; $script:RefreshAt = $null }   # re-learn the addresses
     if ($ok.Count) { Write-History ("Sent to {0}: {1}" -f ($ok -join ', '), $text) }
     $lines = @()
-    if ($ok.Count)  { $lines += "$([char]0x2713)  Delivered to " + ($ok -join ', ') }
-    if ($bad.Count) { $lines += "$([char]0x2715)  Not delivered (PC off?): " + ($bad -join ', ') }
+    if ($ok.Count)    { $lines += "$([char]0x2713)  Delivered to " + ($ok -join ', ') }
+    if ($plain.Count) { $lines += "      (not encrypted for $($plain -join ', '): older version on that PC)" }
+    if ($moved.Count) { $lines += "$([char]0x2715)  Not delivered - address changed, refreshing; send again in a moment: " + ($moved -join ', ') }
+    if ($bad.Count)   { $lines += "$([char]0x2715)  Not delivered (PC off?): " + ($bad -join ', ') }
+    $bad += $moved
     Set-Status ($lines -join "`n") $(if ($bad.Count) { 'error' } else { 'ok' })
     if (-not $bad.Count) { $ui.Msg.Clear(); $ui.Urgent.IsChecked = $false }
     $ui.SendBtn.IsEnabled = $true
@@ -659,7 +769,7 @@ function New-SendWindow {
     $ui.LastSig = $null
     $win.Icon = $WinIcon
     $ui.MeInitials.Text = Get-Initials $MyName
-    $ui.MeName.Text = "Signed in as $MyName  ($MyPc)"
+    $ui.MeName.Text = Get-MeText
 
     foreach ($q in $QuickMessages) {
         $b = New-Object System.Windows.Controls.Button
@@ -733,8 +843,8 @@ function Show-NameDialog {
     try { @{ Name = $new } | ConvertTo-Json | Set-Content -LiteralPath $CfgFile -Encoding UTF8 -ErrorAction Stop }
     catch { [void][System.Windows.MessageBox]::Show("Name changed until restart, but could not be saved: $($_.Exception.Message)", $AppName) }
     Set-TrayText
-    if ($script:SW) { $script:SW.MeInitials.Text = Get-Initials $new; $script:SW.MeName.Text = "Signed in as $new  ($MyPc)" }
-    Send-Udp (New-Packet 'hello') $script:Broadcasts
+    if ($script:SW) { $script:SW.MeInitials.Text = Get-Initials $new; $script:SW.MeName.Text = Get-MeText }
+    Send-Udp (New-Packet 'hello' $CapsText) $script:Broadcasts
 }
 
 # ---------------------------------------------------------------- preview (testing only)
@@ -758,7 +868,7 @@ function Save-WindowPng($Win, [string]$Path) {
 
 # ---------------------------------------------------------------- network
 
-$Peers   = @{}   # pc name -> Pc, Name, Ip, Seen
+$Peers   = @{}   # pc name -> Pc, Name, Ip, Seen, Caps (1 = older version, 2 = v1.2+), Ver
 $SeenIds = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:Broadcasts = @()
 $script:BroadcastsAt = [DateTime]::MinValue
@@ -767,13 +877,13 @@ if ($Preview) {
     New-Item -ItemType Directory -Path $Preview -Force | Out-Null
     # sample data only - fictional names
     $MyPc = 'ADMIN-01'; $MyName = 'Office Admin'
-    $fake ={ param($name, $text, $type = 'msg', $urgent = $false) [pscustomobject]@{ type = $type; name = $name; pc = 'SALES-01'; text = $text; urgent = $urgent } }
+    $fake ={ param($name, $text, $type = 'msg', $urgent = $false) [pscustomobject]@{ v = 2; type = $type; name = $name; pc = 'SALES-01'; text = $text; urgent = $urgent } }
     Show-Message (& $fake 'Arjun - Sales' 'Please come to my desk, need to discuss the client report.') '127.0.0.1' (Join-Path $Preview 'popup-message.png')
     Show-Message (& $fake 'Meera - HR' 'Meeting now in the conference room!' 'msg' $true) '127.0.0.1' (Join-Path $Preview 'popup-urgent.png')
     Show-Message (& $fake 'Ravi - Support' 'Coming now' 'reply') '127.0.0.1' (Join-Path $Preview 'popup-reply.png')
     $i = 0
     foreach ($nm in 'Anita - Accounts', 'Arjun - Sales', 'Ravi - Support', 'Karthik - Developer', 'Meera - HR', 'Divya - Design') {
-        $i++; $Peers["PC-0$i"] = [pscustomobject]@{ Pc = "PC-0$i"; Name = $nm; Ip = '127.0.0.1'; Seen = Get-Date }
+        $i++; $Peers["PC-0$i"] = [pscustomobject]@{ Pc = "PC-0$i"; Name = $nm; Ip = '127.0.0.1'; Seen = Get-Date; Caps = $(if ($i -eq 4) { 1 } else { 2 }); Ver = $AppVersion }
     }
     $ui = New-SendWindow
     [void]$ui.Selected.Add('PC-02'); [void]$ui.Selected.Add('PC-03')
@@ -786,12 +896,13 @@ if ($Preview) {
 
 # ---------------------------------------------------------------- single instance
 
+$instance = if ($Bind -in 'Any', 'Loopback') { "$Port" } else { "$Port-$Bind" }   # testing: one copy per bind address
 $isFirst = $false
-$mutex = New-Object Threading.Mutex($true, "Local\OfficeMessenger-$Port", [ref]$isFirst)
-$showEvent = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::AutoReset, "Local\OfficeMessenger-Show-$Port")
+$mutex = New-Object Threading.Mutex($true, "Local\OfficeMessenger-$instance", [ref]$isFirst)
+$showEvent = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::AutoReset, "Local\OfficeMessenger-Show-$instance")
 if (-not $isFirst) { [void]$showEvent.Set(); return }   # already running: just open its Send window
 
-$bindAddr = if ($Bind -eq 'Loopback') { [Net.IPAddress]::Loopback } else { [Net.IPAddress]::Any }
+$bindAddr = switch ($Bind) { 'Any' { [Net.IPAddress]::Any } 'Loopback' { [Net.IPAddress]::Loopback } default { [Net.IPAddress]::Parse($Bind) } }
 $Tcp = New-Object Net.Sockets.TcpListener($bindAddr, $Port)
 try { $Tcp.Start() } catch {
     [void][System.Windows.MessageBox]::Show("$AppName could not start: port $Port is already in use on this PC.", $AppName, 'OK', 'Error')
@@ -805,6 +916,7 @@ try { [void]$Udp.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null) } ca
 function Update-Broadcasts {
     $script:BroadcastsAt = Get-Date
     if ($Bind -eq 'Loopback') { $script:Broadcasts = @('127.0.0.1'); return }
+    if ($Bind -ne 'Any') { $script:Broadcasts = @('127.0.0.1', '127.0.0.2', '127.0.0.3'); return }   # testing on one PC
     $list = foreach ($a in (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
         if ($a.IPAddress -like '127.*' -or $a.IPAddress -like '169.254.*' -or $a.PrefixLength -ge 32) { continue }
         $b = [Net.IPAddress]::Parse($a.IPAddress).GetAddressBytes()
@@ -825,7 +937,13 @@ function Send-Udp([string]$Json, [string[]]$To) {
 
 function Set-Peer($p, [string]$Ip) {
     if ($p.pc -eq $MyPc) { return }
-    $Peers[$p.pc] = [pscustomobject]@{ Pc = $p.pc; Name = $p.name; Ip = $Ip; Seen = Get-Date }
+    $old = $Peers[$p.pc]
+    if ($p.v -eq 2) { $caps = 2; $ver = $p.ver }
+    elseif ($p.type -in 'hello', 'hello?', 'bye') { $c = Read-Caps $p.text; $caps = $c.Caps; $ver = $c.Ver }
+    elseif ($old -and $old.Caps -ge 2) { $caps = $old.Caps; $ver = $old.Ver }   # v1.2+ PC that hadn't heard our hello yet
+    else { $caps = 1; $ver = '' }                                                # older version
+    $Peers[$p.pc] = [pscustomobject]@{ Pc = $p.pc; Name = $p.name; Ip = $Ip; Seen = Get-Date; Caps = $caps; Ver = $ver }
+    if ($ver) { Set-NewerVersion $ver " on $($p.name)'s PC ($($p.pc))" }
 }
 
 # Handles everything that has arrived: presence (UDP) and messages (TCP)
@@ -838,7 +956,7 @@ function Invoke-Poll {
         $ip = $ep.Address.ToString()
         if ($p.type -eq 'bye') { $Peers.Remove($p.pc); continue }
         Set-Peer $p $ip
-        if ($p.type -eq 'hello?') { Send-Udp (New-Packet 'hello') @($ip) }
+        if ($p.type -eq 'hello?') { Send-Udp (New-Packet 'hello' $CapsText) @($ip) }
     }
     while ($Tcp.Pending()) {
         $client = $Tcp.AcceptTcpClient()
@@ -849,10 +967,11 @@ function Invoke-Poll {
             $w = New-Object IO.StreamWriter($s, (New-Object Text.UTF8Encoding($false))); $w.AutoFlush = $true
             $p = Read-Packet ($r.ReadLine())
             if (-not $p) { $w.WriteLine('NO'); continue }
+            if ($p.v -eq 2 -and $p.to -ne $MyPc) { $w.WriteLine('WRONG'); continue }   # meant for another PC
             $w.WriteLine('OK')
+            if ($p.type -eq 'ping') { $w.WriteLine("VER $AppVersion"); continue }      # status check tool
             if (-not $SeenIds.Add($p.id)) { continue }   # duplicate
-            Set-Peer $p $ip
-            if ($p.type -in 'msg', 'reply') { Show-Message $p $ip }
+            if ($p.type -in 'msg', 'reply') { Set-Peer $p $ip; Show-Message $p $ip }
         } catch {} finally { $client.Close() }
     }
 }
@@ -869,11 +988,64 @@ function Stop-Messenger {
     $script:App.Shutdown()
 }
 
+# ---------------------------------------------------------------- update notice
+# Learns about newer versions from other PCs' announcements (works offline) and, once a day,
+# from the project's latest GitHub release. Turn the GitHub check off with "UpdateCheck": false in config.json.
+
+$script:NewerVersion = $null
+$script:UpdateTask = $null
+$script:NextUpdateCheck = (Get-Date).AddMinutes(2)
+
+function Set-NewerVersion([string]$Ver, [string]$Where) {
+    if (-not $Ver) { return }
+    $v = ConvertTo-Version $Ver
+    if ($v -le (ConvertTo-Version $AppVersion)) { return }
+    if ($script:NewerVersion -and (ConvertTo-Version $script:NewerVersion) -ge $v) { return }
+    $script:NewerVersion = "$($v.Major).$($v.Minor).$($v.Build)"
+    $script:MiUpdate.Text = "Update available: v$($script:NewerVersion)"
+    $script:MiUpdate.Visible = $true
+    if ($script:SW) { $script:SW.MeName.Text = Get-MeText }
+    $script:Tray.ShowBalloonTip(10000, $AppName, "A newer version (v$($script:NewerVersion)) is available$Where.`nRight-click this icon for how to update.", 'Info')
+}
+
+function Start-UpdateCheck {
+    if (-not $UpdateCheck -or $script:UpdateTask) { return }
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $wc = New-Object Net.WebClient
+        $wc.Headers.Add('User-Agent', "OfficeMessenger/$AppVersion")
+        $api = 'https://api.github.com/repos/' + ($ProjectUrl -replace '^https://github\.com/', '') + '/releases/latest'
+        $script:UpdateTask = $wc.DownloadStringTaskAsync($api)
+    } catch {}
+}
+
+function Receive-UpdateCheck {
+    $t = $script:UpdateTask
+    if (-not $t -or -not $t.IsCompleted) { return }
+    $script:UpdateTask = $null
+    if ($t.Status -eq 'RanToCompletion') { try { Set-NewerVersion ($t.Result | ConvertFrom-Json).tag_name ' on GitHub' } catch {} }
+}
+
+function Show-UpdateHelp {
+    $msg = "Office Messenger v$($script:NewerVersion) is available (this PC has v$AppVersion).`n`n" +
+           "To update this PC: run Setup-This-PC.bat from the updated kit, answer n to network sharing " +
+           "and Y to Office Messenger. Your name and office key are kept.`n`n" +
+           "Updating is optional: different versions keep working together.`n`nOpen the download page?"
+    if ([System.Windows.MessageBox]::Show($msg, $AppName, 'YesNo', 'Information') -eq 'Yes') { Start-Process "$ProjectUrl/releases/latest" }
+}
+
 $script:Tray = New-Object System.Windows.Forms.NotifyIcon
 $script:Tray.Icon = $TrayIcon
 Set-TrayText
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $menu.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+$miVersion = $menu.Items.Add("$AppName v$AppVersion")
+$miVersion.Enabled = $false
+$script:MiUpdate = $menu.Items.Add('Update available', $null, { Show-UpdateHelp })
+$script:MiUpdate.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+$script:MiUpdate.ForeColor = [System.Drawing.Color]::FromArgb(22, 101, 52)
+$script:MiUpdate.Visible = $false
+[void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $miSend = $menu.Items.Add('Send a message', $null, { Show-SendWindow })
 $miSend.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
 [void]$menu.Items.Add('Message history', $null, {
@@ -905,16 +1077,18 @@ $timer.Add_Tick({
         $now = Get-Date
         if ($script:RefreshAt -and $now -ge $script:RefreshAt) { $script:RefreshAt = $null; Update-PeopleList; Set-Status '' }
         if ($script:SW -and ($now - $script:LastListUpdate).TotalSeconds -ge 5) { $script:LastListUpdate = $now; Update-PeopleList }
+        Receive-UpdateCheck
+        if ($now -ge $script:NextUpdateCheck) { $script:NextUpdateCheck = $now.AddHours(24); Start-UpdateCheck }
         if (($now - $script:LastHello).TotalSeconds -ge 60) {
             $script:LastHello = $now
             if (-not $script:Broadcasts.Count -or ($now - $script:BroadcastsAt).TotalMinutes -ge 5) { Update-Broadcasts }
-            Send-Udp (New-Packet 'hello') $script:Broadcasts
+            Send-Udp (New-Packet 'hello' $CapsText) $script:Broadcasts
         }
     } catch { Write-History "Error: $($_.Exception.Message)" }
 })
 
 Update-Broadcasts
-Send-Udp (New-Packet 'hello?') $script:Broadcasts   # announce ourselves and ask who is online
+Send-Udp (New-Packet 'hello?' $CapsText) $script:Broadcasts   # announce ourselves and ask who is online
 $timer.Start()
 if ($Show) { Show-SendWindow }
 
