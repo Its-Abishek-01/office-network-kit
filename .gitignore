@@ -1,0 +1,15 @@
+# Office secret key - created by the first setup. NEVER commit it:
+# anyone with it can send pop-ups to that office's PCs.
+messenger-key.txt
+
+# Local list of set-up PCs (names, IPs, MAC addresses, users)
+office-pcs.csv
+*.csv
+
+# Messenger runtime files
+config.json
+history.txt
+
+# Windows
+Thumbs.db
+desktop.ini
