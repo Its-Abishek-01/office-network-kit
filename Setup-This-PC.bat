@@ -170,6 +170,14 @@ if (Ask-YesNo 'Install Office Messenger on this PC?') {
             }
             Ok "Firewall allows the messenger on the office network only (port $Port)"
 
+            # Launch through conhost --headless so no console window ever appears. Starting
+            # powershell.exe directly is not enough: when Windows Terminal is the default terminal,
+            # -WindowStyle Hidden is ignored and closing that window stops the messenger.
+            # (--headless needs Windows 10 1809 / build 17763 or later.)
+            $conhost = "$env:SystemRoot\System32\conhost.exe"
+            $psArgs  = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$dst\OfficeMessenger.ps1`""
+            $headless = ([Environment]::OSVersion.Version.Build -ge 17763) -and (Test-Path $conhost)
+
             $ws = New-Object -ComObject WScript.Shell
             $links = @(
                 @{ Path = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\Office Messenger.lnk"; Extra = '' },
@@ -178,8 +186,13 @@ if (Ask-YesNo 'Install Office Messenger on this PC?') {
             )
             foreach ($lnk in $links) {
                 $s = $ws.CreateShortcut($lnk.Path)
-                $s.TargetPath = $PS
-                $s.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$dst\OfficeMessenger.ps1`" $($lnk.Extra)".Trim()
+                if ($headless) {
+                    $s.TargetPath = $conhost
+                    $s.Arguments = "--headless `"$PS`" $psArgs $($lnk.Extra)".Trim()
+                } else {
+                    $s.TargetPath = $PS
+                    $s.Arguments = "$psArgs $($lnk.Extra)".Trim()
+                }
                 $s.WorkingDirectory = $dst
                 $s.IconLocation = "$dst\OfficeMessenger.ico,0"
                 $s.WindowStyle = 7
