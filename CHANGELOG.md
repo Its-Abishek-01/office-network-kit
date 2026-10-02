@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.3.0
+
+Compatible with v1.0 - v1.2: PCs can be updated one at a time and keep messaging each other.
+
+### Added
+- **My profile.** Click your own avatar (or tray menu → *My profile*) to set your name and a photo. Photos are cropped to a circle, shrunk to about 10 KB, and appear in everyone's Send list and on your pop-ups. Other PCs fetch a changed photo once and keep it.
+- **Away status.** A person shows as **Away** (amber) when their PC is locked or has had no mouse/keyboard input for 5 minutes (`AwayMinutes` in `config.json`). The sender is told when a message went to someone who is away.
+- **Update now.** When a newer version exists, the Send window shows **Update** and the tray menu *Update now*. One click and the Windows prompt: the new version is fetched from an office PC that already has it (no internet needed) or from the latest GitHub release, and installed **only if it carries the publisher's RSA-3072 signature** and is newer. The installed program re-checks the signature as administrator right before replacing itself, then restarts.
+- **`Update-Messenger.bat`.** One-click update from the kit, with no questions; closes by itself. Use it once to bring v1.0 - v1.2 PCs to v1.3.
+- `dev\Build-Release.ps1` (build and sign a release) and `dev\New-SigningKey.ps1` (key for your own builds).
+
+### Changed
+- Saving the profile keeps other `config.json` settings (the old name box rewrote the whole file).
+- Setup and update also install the release signature, so every PC can pass updates on to the others.
+
 ## v1.2.0
 
 Fully compatible with v1.0 and v1.1: PCs can be updated one at a time, and old and new versions keep messaging each other.

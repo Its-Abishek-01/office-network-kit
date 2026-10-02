@@ -28,10 +28,14 @@ CHECK THE WHOLE OFFICE
   It lists every PC: messenger running + version, file sharing on/off.
 
 UPDATING TO A NEW VERSION
-  Copy your messenger\messenger-key.txt into the new kit first, then run
-  Setup-This-PC.bat on each PC: n to network sharing, Y to Office Messenger.
+  From v1.3.0 on: click Update in Office Messenger (or right-click the tray
+  icon -> Update now) and click Yes. That's all.
+
+  PCs on v1.0 - v1.2 (once): copy your messenger\messenger-key.txt into the
+  new kit, then double-click  Update-Messenger.bat  on each PC and click Yes.
+  No questions - it closes by itself. Name and office key are kept.
+
   No need to update all PCs at once - old and new versions work together.
-  Messages are encrypted when BOTH PCs run v1.2 or later.
 
 THE OFFICE KEY (messenger-key.txt)
   - The FIRST time you install the messenger, the setup creates a new office key
@@ -46,7 +50,9 @@ USING OFFICE MESSENGER
   - Urgent = red pop-up with alert sound.
   - The person can reply with one click (Coming now / Give me 5 min / OK, seen)
     or type a reply.
-  - Right-click the icon: Message history, Change my name, Exit.
+  - Click your own picture at the top to set your name and photo.
+  - Amber "Away" = that PC is locked or nobody touched it for 5 minutes.
+  - Right-click the icon: Message history, My profile, Update now, Exit.
   - A PC only receives messages while it is switched on and someone is signed in.
 
 SHARING THIS KIT WITH SOMEONE ELSE

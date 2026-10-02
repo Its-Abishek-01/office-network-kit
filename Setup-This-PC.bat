@@ -152,6 +152,8 @@ if (Ask-YesNo 'Install Office Messenger on this PC?') {
         try {
             New-Item -ItemType Directory -Path $dst -Force -ErrorAction Stop | Out-Null
             Copy-Item -LiteralPath (Join-Path $src 'OfficeMessenger.ps1'), (Join-Path $src 'messenger-key.txt') -Destination $dst -Force -ErrorAction Stop
+            # the release signature lets this PC pass the program on to other office PCs ("Update now")
+            if (Test-Path -LiteralPath (Join-Path $src 'OfficeMessenger.ps1.sig')) { Copy-Item -LiteralPath (Join-Path $src 'OfficeMessenger.ps1.sig') -Destination $dst -Force -ErrorAction Stop }
             & $PS -NoProfile -ExecutionPolicy Bypass -File "$dst\OfficeMessenger.ps1" -MakeIcon "$dst\OfficeMessenger.ico"
             Ok "Program copied to $dst"
 
